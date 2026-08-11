@@ -65,15 +65,13 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(-
 <div id="app"></div>
 <script>
 /* ==========================================================================
-   DEMON MYTHS — REAL SCORING EDITION
+   DEMON MYTHS — REAL SCORING EDITION (GitHub Pages build)
    No simulation. Points come from things that actually happened:
      \u25CF pointercrate records feed  -> every approved list record by your players
      \u25CF pointercrate demons diff   -> a NEW level on the list = real First Victor
-     \u25CF GDBrowser (GD Colon's API) -> demon count on their actual GD profile
-     \u2726 AI headline sync           -> inside claude.ai, where direct APIs are
-                                       sandboxed, Claude web-searches recent
-                                       completions instead (clearly labeled)
-   Deploy this file on any normal host (GitHub Pages) for full auto-tracking.
+     \u25CF GDBrowser (GD Colon's API) -> demon count on their actual GD profile,
+                                       routed through a public CORS relay because
+                                       GDBrowser sends no CORS headers itself
    ========================================================================== */
 
 // ---------- helpers ----------
@@ -121,10 +119,8 @@ let expandRow = null;
 let boardShown = 25;
 let dropSel = null;
 let editGd = null;         // pid whose GD name is being edited
-let modal = null;
 let syncing = false;
 let syncMsg = '';
-const scoutCache = {};
 
 // ---------- fetch layer ----------
 async function tryFetchRaw(url, ms){
@@ -155,39 +151,6 @@ async function loadFromAPI(){
   };
 }
 
-async function askClaude(promptText){
-  const resp = await fetch('https://api.anthropic.com/v1/messages',{
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({model:'claude-sonnet-4-6', max_tokens:1000,
-      messages:[{role:'user',content:promptText}],
-      tools:[{type:'web_search_20250305',name:'web_search'}]}),
-  });
-  const data = await resp.json();
-  if(!data || !data.content) throw new Error('no content');
-  return data.content.filter(b=>b.type==='text').map(b=>b.text).join('\n');
-}
-function extractJSON(text){
-  const cleaned = text.replace(/```json|```/g,'').trim();
-  const a = cleaned.indexOf('{'), b = cleaned.lastIndexOf('}');
-  if(a<0||b<0) throw new Error('no json');
-  return JSON.parse(cleaned.slice(a,b+1));
-}
-
-async function loadFromAI(){
-  const prompt = 'Search the web for CURRENT Geometry Dash competitive data. Searches: "pointercrate stats viewer top players", '
-   + '"demonlist top demons", "geometry dash upcoming top 1 verification progress". Respond ONLY with minified JSON, no fences: '
-   + '{"updated":"YYYY-MM-DD","players":[{"rank":1,"name":"...","score":123.4,"country":"US"}],'
-   + '"demons":[{"position":1,"name":"...","verifier":"..."}],"watch":[{"player":"...","level":"...","note":"short status"}]}. '
-   + 'players = current top stats-viewer players IN ORDER, as many as results support, max 25, never invented; score null if unknown. '
-   + 'demons = current top 10-15. watch = 4-8 REAL ongoing verification projects. Only facts from results.';
-  const j = extractJSON(await askClaude(prompt));
-  if(!j.players || !j.players.length) throw new Error('empty');
-  return {source:'ai', updated:(j.updated||today()),
-    players:j.players.map((p,i)=>({rank:p.rank||i+1,name:String(p.name||'').slice(0,30)||('p'+(i+1)),score:(typeof p.score==='number')?p.score:null,country:p.country||''})),
-    demons:(j.demons||[]).map(d=>({position:d.position,name:d.name,verifier:d.verifier||''})),
-    watch:(j.watch||[]).filter(w=>w&&w.level)};
-}
-
 async function bootData(skipCache){
   bootLog=[]; renderBoot();
   const log = (s)=>{ bootLog.push(s); renderBoot(); };
@@ -195,15 +158,13 @@ async function bootData(skipCache){
   const api = await loadFromAPI();
   if(api){ log('\u25CF LIVE \u2014 top '+api.players.length+' straight from the List'); DATA=api;
     await store.set(KEY_DATA, JSON.stringify(api)); return; }
-  log('direct API blocked here (normal inside claude.ai)');
+  log('pointercrate unreachable \u2014 check your connection');
   if(!skipCache){
     try{ const raw = await store.get(KEY_DATA);
-      if(raw){ const c=JSON.parse(raw); if(c&&c.players&&c.players.length){ log('using last sync ('+c.updated+')'); DATA=c; return; } }
+      if(raw){ const c=JSON.parse(raw); if(c&&c.players&&c.players.length){ log('using last saved data ('+c.updated+')'); DATA=c; return; } }
     }catch(e){}
   }
-  log('AI sync: sending Claude to search the live web\u2026');
-  try{ const ai = await loadFromAI(); log('\u2726 synced '+ai.players.length+' players, '+ai.demons.length+' demons'); DATA=ai;
-    await store.set(KEY_DATA, JSON.stringify(ai)); return; }catch(e){ log('AI sync unavailable \u2014 snapshot mode'); }
+  log('falling back to built-in snapshot');
   DATA = SNAPSHOT;
 }
 
@@ -388,6 +349,28 @@ function diffNewDemons(freshDemons){
 }
 
 // ---------- GDBrowser profile tracking (GD Colon's API) ----------
+// GDBrowser's server sends no CORS headers, so browsers can't call it
+// directly from another site. We route through public CORS relays instead
+// (corsproxy.io's free tier allows github.io origins). Only public GD
+// usernames ever pass through the relay.
+const GD_PROXIES = [
+  (u)=>u, // try direct first, in case CORS is ever enabled
+  (u)=>'https://corsproxy.io/?url='+encodeURIComponent(u),
+  (u)=>'https://api.allorigins.win/raw?url='+encodeURIComponent(u),
+  (u)=>'https://api.codetabs.com/v1/proxy/?quest='+encodeURIComponent(u),
+];
+let gdRoute = null; // remembers which relay worked this session
+async function fetchGD(path){
+  const target = GDB + path;
+  const idxs = GD_PROXIES.map((_,i)=>i);
+  const order = gdRoute!=null ? [gdRoute, ...idxs.filter(i=>i!==gdRoute)] : idxs;
+  for(const i of order){
+    const r = await tryFetchRaw(GD_PROXIES[i](target), 12000);
+    if(r.json!==null){ gdRoute=i; return r; }
+  }
+  return {json:null, link:null, status:0};
+}
+
 async function syncGDProfiles(){
   const pids = rosteredPids();
   // quick reachability check with the first player
@@ -395,13 +378,13 @@ async function syncGDProfiles(){
     const p = gp(pids[i]);
     syncMsg = 'checking GD profiles '+(i+1)+'/'+pids.length+' ('+p.name+')\u2026'; renderSyncBar();
     const uname = p.gdName || p.name;
-    const rr = await tryFetchRaw(GDB+'/profile/'+encodeURIComponent(uname), 9000);
-    if(i===0 && rr.json===null && rr.status===0){ // whole API unreachable -> skip pass
-      addEvent({source:'note', player:'', team:'', pts:0, txt:'GDBrowser unreachable here \u2014 profile tracking works in the deployed version', video:null});
+    const rr = await fetchGD('/profile/'+encodeURIComponent(uname));
+    if(i===0 && rr.json===null && rr.status===0){ // unreachable even via relays -> skip pass
+      addEvent({source:'note', player:'', team:'', pts:0, txt:'GDBrowser couldn\u2019t be reached (even through a relay) \u2014 profile points will catch up next check', video:null});
       return false;
     }
     const j = rr.json;
-    if(!j || typeof j.demons!=='number'){ p.gdStatus='miss'; await sleep(300); continue; }
+    if(!j || typeof j.demons!=='number'){ p.gdStatus='miss'; await sleep(1200); continue; }
     p.gdStatus='ok';
     if(p.gdDemons==null){
       p.gdDemons = j.demons;
@@ -411,38 +394,9 @@ async function syncGDProfiles(){
       award(pids[i], d*GD_DEMON_PTS, { source:'gd', txt:'+'+d+' new demon'+(d>1?'s':'')+' beaten on their GD profile ('+p.gdDemons+' \u2192 '+j.demons+')', video:null });
       p.gdDemons = j.demons;
     } else { p.gdDemons = j.demons; }
-    await sleep(300); // be considerate to GDBrowser
+    await sleep(1200); // be considerate to GDBrowser + the relay (rate limits)
   }
   return true;
-}
-
-// ---------- AI headline fallback (claude.ai) ----------
-async function aiHeadlineSync(){
-  const names = rosteredPids().map(pid=>gp(pid).name);
-  const prompt = 'Search the web for Geometry Dash demonlist records and notable completions from roughly the last 14 days involving ANY of these players: '
-   + names.join(', ') + '. Also search "demonlist recent records" and "new hardest demon verified". '
-   + 'Respond ONLY with minified JSON, no fences: {"records":[{"player":"exact name from my list","level":"...","position":null,"progress":100,"note":"short"}],'
-   + '"newLevels":[{"level":"...","verifier":"...","position":null}]}. Max 12 records. position = list placement as an integer if known, else null. '
-   + 'progress = 100 for full completions, else the percent. ONLY include events actually found in search results for players on my list; empty arrays are fine.';
-  const j = extractJSON(await askClaude(prompt));
-  let scored = 0;
-  (j.records||[]).forEach(rc=>{
-    const pid = pidByName(rc.player); if(!pid) return;
-    const prog = (typeof rc.progress==='number')?rc.progress:100;
-    const key = 'rec|'+rc.player+'|'+(rc.level||'?')+'|'+prog;
-    if(seenKey(key)) return;
-    const pts = scoreRecord((typeof rc.position==='number')?rc.position:null, prog);
-    if(pts<=0) return;
-    award(pid, pts, { source:'ai', txt:(prog>=100?('CLEAR \u2014 '):('new best '+prog+'% on '))+(rc.level||'a listed demon')+(rc.note?(' \u00B7 '+rc.note):''), video:null });
-    scored++;
-  });
-  (j.newLevels||[]).forEach(nl=>{
-    const key=String(nl.level||'').toLowerCase(); if(!key||game.knownDemons.includes(key)) return;
-    game.knownDemons.push(key);
-    const pid = pidByName(nl.verifier);
-    if(pid && !seenKey('fv|'+nl.verifier+'|'+nl.level)){ award(pid, FIRST_VICTOR_PTS, {source:'ai', txt:'\u26A1 FIRST VICTOR \u2014 verified '+nl.level, video:null}); scored++; }
-  });
-  return scored;
 }
 
 // ---------- the sync button ----------
@@ -482,43 +436,12 @@ async function syncScores(){
       // 4) GD profiles via GDBrowser
       await syncGDProfiles();
     } else {
-      // claude.ai path: AI headline sync
-      syncMsg='Claude is searching the live web for your players\u2019 recent clears\u2026 (15\u201340s)'; renderSyncBar();
-      try{
-        const n = await aiHeadlineSync();
-        addEvent({source:'note', player:'', team:'', pts:0, txt:'\u2726 AI headline check done \u2014 '+n+' scored event'+(n===1?'':'s')+' (full auto-tracking needs the deployed version)', video:null});
-      }catch(e){
-        addEvent({source:'note', player:'', team:'', pts:0, txt:'AI headline check failed \u2014 try again in a moment', video:null});
-      }
+      // pointercrate unreachable this time — nothing is scored, nothing invented
+      addEvent({source:'note', player:'', team:'', pts:0, txt:'pointercrate couldn\u2019t be reached \u2014 nothing scored this check, try again in a bit', video:null});
     }
     game.lastSync = nowStr();
   } finally {
     syncing=false; syncMsg=''; tab='scores'; await persistGame(); render();
-  }
-}
-
-// ---------- scout ----------
-async function doScout(name){
-  if(scoutCache[name]){ modal={title:'Scout: '+name, html:scoutCache[name]}; render(); return; }
-  modal = {title:'Scout: '+name, loading:true}; render();
-  try{
-    const prompt = 'Search the web for what Geometry Dash player "'+name+'" is doing RIGHT NOW: the level they are grinding or verifying, recent records, and their actual Twitch/YouTube channel URLs. '
-     + 'Respond ONLY with minified JSON: {"summary":"2-3 sentences","working_on":["..."],"links":[{"label":"...","url":"https://..."}]}. Only URLs literally in search results.';
-    const j = extractJSON(await askClaude(prompt));
-    let html = '<div style="color:var(--text);font-size:14px;line-height:1.55">'+esc(j.summary||'Not much surfaced.')+'</div>';
-    if(j.working_on&&j.working_on.length){
-      html += '<div class="mono" style="font-size:11px;color:var(--dim);letter-spacing:1px;margin:12px 0 6px">CURRENTLY GRINDING</div>'
-        + j.working_on.map(w=>'<div class="feeditem" style="border-left:3px solid var(--gold);margin-bottom:6px;font-size:13px">'+esc(w)+'</div>').join('');
-    }
-    if(j.links&&j.links.length){
-      html += '<div class="mono" style="font-size:11px;color:var(--dim);letter-spacing:1px;margin:12px 0 6px">FOUND CHANNELS</div><div style="display:flex;gap:6px;flex-wrap:wrap">'
-        + j.links.slice(0,5).map(l=>{ const u=String(l.url||''); if(!/^https:\/\//.test(u)) return '';
-            return '<a class="smbtn" target="_blank" rel="noopener" href="'+esc(u)+'">'+esc(l.label||'link')+' \u2197</a>'; }).join('')+'</div>';
-    }
-    html += '<div style="color:var(--dim);font-size:11px;margin-top:14px">AI-searched just now \u2014 double-check on their channel.</div>';
-    scoutCache[name]=html; modal={title:'Scout: '+name, html}; render();
-  }catch(e){
-    modal={title:'Scout: '+name, html:'<div style="color:var(--dim);font-size:14px">Live scouting needs the claude.ai version (it uses Claude\u2019s web search). The Twitch / YouTube / GDBrowser buttons always work.</div>'}; render();
   }
 }
 
@@ -593,7 +516,7 @@ function boardRowHTML(entry){
      + '<a class="smbtn" target="_blank" rel="noopener" href="'+linkYT(entry.name)+'">YouTube \u2197</a>'
      + '<a class="smbtn" target="_blank" rel="noopener" href="'+linkGDB(entry.name)+'">GD profile \u2197</a>'
      + '<a class="smbtn" target="_blank" rel="noopener" href="'+LINK_PC+'">stats viewer \u2197</a>'
-     + '<button class="smbtn" data-a="scout" data-name="'+esc(entry.name)+'" style="border-color:var(--gold);color:var(--gold)">\uD83D\uDD0D scout</button></div>';
+     + '</div>';
   }
   return html;
 }
@@ -632,7 +555,7 @@ function render(){
      + (tab==='board'?('<div class="panel" style="margin-top:12px;text-align:left">'+DATA.players.slice(0,boardShown).map(boardRowHTML).join('')
         + (boardShown<DATA.players.length?'<button class="smbtn" data-a="more" style="margin-top:10px">show more</button>':'')+'</div>'):'')
      + '</div>';
-    app.innerHTML = html; if(modal) app.innerHTML+=modalHTML(); if(confirmReset) app.innerHTML+=resetHTML();
+    app.innerHTML = html; if(confirmReset) app.innerHTML+=resetHTML();
     return;
   }
 
@@ -652,7 +575,7 @@ function render(){
      + '<div class="mono" style="font-size:12.5px;max-height:150px;overflow-y:auto;display:grid;gap:3px">'
      + (game.draftLog.length?game.draftLog.map(d=>'<div style="color:'+(d.you?'var(--gold)':'var(--dim)')+'">#'+d.n+' '+esc(d.team)+' \u2192 '+esc(d.player)+'</div>').join(''):'<div style="color:var(--dim)">waiting\u2026</div>')
      + '</div></div></div>';
-    app.innerHTML = html; if(modal) app.innerHTML+=modalHTML(); if(confirmReset) app.innerHTML+=resetHTML();
+    app.innerHTML = html; if(confirmReset) app.innerHTML+=resetHTML();
     return;
   }
 
@@ -711,7 +634,6 @@ function render(){
         const p=gp(pid);
         return '<div>'+playerCardHTML(p,{})
          + '<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">'
-         + '<button class="smbtn" data-a="scout" data-name="'+esc(p.name)+'">\uD83D\uDD0D</button>'
          + '<a class="smbtn" target="_blank" rel="noopener" href="'+linkYTLive(p.name)+'">\uD83D\uDD34</a>'
          + '<a class="smbtn" target="_blank" rel="noopener" href="'+linkTwitch(p.name)+'">TW</a>'
          + '<a class="smbtn" target="_blank" rel="noopener" href="'+linkGDB(p.gdName||p.name)+'">GD \u2197</a>'
@@ -748,16 +670,15 @@ function render(){
      + 'Your first <b style="color:var(--gold)">\u21BB check</b> sets the baseline: the newest pointercrate record ID and every rostered player\u2019s current GD demon count. '
      + 'After that, each check pulls every record approved since, diffs the List for brand-new levels (real first victors!), and re-reads GD profiles via GDBrowser \u2014 GD Colon\u2019s API. '
      + 'A record card links straight to the actual completion video when pointercrate has it.<br><br>'
-     + '<b style="color:var(--text)">Where it runs:</b> hosted on a normal site (GitHub Pages), all of that is automatic. '
-     + 'Inside claude.ai the sandbox blocks those APIs, so \u21BB check instead sends Claude to web-search your players\u2019 recent completions and scores only what it can verify \u2014 those events are labeled \u2726 AI-FOUND. '
-     + 'Points only ever come from events with a source; nothing is invented.<br><br>'
-     + '<b style="color:var(--text)">Fair play:</b> CPU squads score from the exact same real feeds. One free-agent swap per day. '
+     + '<b style="color:var(--text)">The relay:</b> GDBrowser doesn\u2019t allow direct calls from other websites (no CORS headers), so profile checks go through a public relay like corsproxy.io \u2014 only public GD usernames are ever sent, and the checks are paced politely, which is why a full check takes about half a minute. '
+     + 'If every relay is down, that check just skips profiles and catches up next time.<br><br>'
+     + '<b style="color:var(--text)">Fair play:</b> points only ever come from events with a real source \u2014 nothing is invented, and if a feed can\u2019t be reached, nothing is scored. '
+     + 'CPU squads score from the exact same feeds. One free-agent swap per day. '
      + 'GD profile counts include every rated demon (so a stream night of easy demons still pays 4 apiece), and list records stack on top.</div></div>';
   }
 
   html += '<div style="height:90px"></div></div>';
   app.innerHTML = html;
-  if(modal) app.innerHTML += modalHTML();
   if(confirmReset) app.innerHTML += resetHTML();
 }
 
@@ -779,14 +700,6 @@ function tickerHTML(){
   const t = bits.length?bits:MEMES;
   const i = Math.floor(Date.now()/16000);
   return '<div class="ticker-outer"><div class="ticker-inner mono">&nbsp;&nbsp;&nbsp;\u27E1 '+esc(t[i%t.length])+' &nbsp;&nbsp;&nbsp;\u27E1 '+esc(t[(i+1)%t.length])+'</div></div>';
-}
-function modalHTML(){
-  return '<div class="modalbg" data-a="closeModalBg"><div class="modal">'
-   + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
-   + '<div class="display" style="font-size:18px">'+esc(modal.title)+'</div>'
-   + '<button class="smbtn" data-a="closeModal">\u2715</button></div>'
-   + (modal.loading?'<div style="color:var(--dim);font-size:14px"><span class="spinner"></span>&nbsp; searching the live web\u2026 (10\u201330s)</div>':modal.html)
-   + '</div></div>';
 }
 function resetHTML(){
   return '<div class="modalbg"><div class="modal" style="max-width:340px;text-align:center">'
@@ -810,9 +723,6 @@ document.addEventListener('click',(e)=>{
   else if(a==='saveGd') setGdName(id);
   else if(a==='expand'){ expandRow=(expandRow===Number(id)?null:Number(id)); render(); }
   else if(a==='more'){ boardShown=Math.min(boardShown+25, DATA.players.length); render(); }
-  else if(a==='scout') doScout(el.getAttribute('data-name'));
-  else if(a==='closeModal'){ modal=null; render(); }
-  else if(a==='closeModalBg'){ if(e.target===el){ modal=null; render(); } }
   else if(a==='reset'){ confirmReset=true; render(); }
   else if(a==='resetCancel'){ confirmReset=false; render(); }
   else if(a==='resetConfirm') resetAll();
@@ -823,7 +733,7 @@ document.addEventListener('keydown',(e)=>{
   if(e.key==='Enter' && e.target.id==='nameInput') startDraft();
   if(e.key==='Enter' && e.target.id && e.target.id.indexOf('gdin_')===0) setGdName(e.target.id.slice(5));
 });
-setInterval(()=>{ const outer=document.querySelector('.ticker-outer'); if(outer && !modal && game && !syncing){
+setInterval(()=>{ const outer=document.querySelector('.ticker-outer'); if(outer && game && !syncing){
   const tmp=document.createElement('div'); tmp.innerHTML=tickerHTML(); outer.replaceWith(tmp.firstChild); } }, 16000);
 
 // ---------- boot ----------
