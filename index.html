@@ -539,7 +539,17 @@ const pinHash = (name,pin)=> hashStr(String(name).toLowerCase()+'|'+String(pin))
 const leagueCode = ()=>{ const A='ABCDEFGHJKMNPQRSTUVWXYZ23456789'; let c='DM';
   for(let i=0;i<4;i++) c+=A[Math.floor(Math.random()*A.length)]; return c; };
 
-function sbHeaders(){ return {apikey:MP.key, 'Authorization':'Bearer '+MP.key, 'Prefer':'return=representation'}; }
+function sbHeaders(){
+  const h = {apikey:MP.key, 'Prefer':'return=representation'};
+  if(/^eyJ/.test(MP.key)) h['Authorization'] = 'Bearer '+MP.key; // legacy anon JWT only
+  return h; // new sb_publishable_ keys must NOT go in Authorization
+}
+function sbFail(st){
+  if(st===0)   return 'can\u2019t reach that server \u2014 check the Project URL (it ends in .supabase.co) and your internet';
+  if(st===401||st===403) return 'the key was rejected \u2014 grab the key from Settings \u2192 API Keys (either the publishable one or, on the Legacy tab, the anon public one) and make sure the SQL snippet was run';
+  if(st===404) return 'the leagues table wasn\u2019t found \u2014 open SQL Editor, paste the snippet from the setup screen, hit Run, then try again';
+  return 'the server said no (status '+st+') \u2014 re-check the setup steps';
+}
 async function sbCall(method, path, body){
   if(!MP || !MP.url || !MP.key) return {json:null,status:0};
   const base = MP.url.replace(/\/+$/,'');
@@ -578,10 +588,16 @@ async function mpMutate(fn, tries){
 }
 
 async function mpSaveCfg(){
-  const u = ($('mpUrl')&&$('mpUrl').value.trim())||''; const k = ($('mpKey')&&$('mpKey').value.trim())||'';
-  if(!/^https:\/\/.+supabase\./.test(u) || k.length<20){ mpStatus='that doesn\u2019t look like a Supabase URL + anon key yet'; render(); return; }
-  MP = {url:u, key:k}; await store.set(KEY_MPCFG, JSON.stringify(MP));
-  mpStatus=''; mpScreen='home'; render();
+  const u = ($('mpUrl')&&$('mpUrl').value.trim().replace(/\/+$/,''))||''; const k = ($('mpKey')&&$('mpKey').value.trim())||'';
+  if(/supabase\.com/i.test(u)){ mpStatus='that\u2019s the dashboard address \u2014 you need the Project URL, like https://abcdefgh.supabase.co (find it in Settings \u2192 API)'; render(); return; }
+  if(!/^https:\/\//.test(u) || k.length<20){ mpStatus='that doesn\u2019t look like a Project URL + key yet'; render(); return; }
+  MP = {url:u, key:k};
+  mpLoading=true; mpStatus='testing the connection\u2026'; render();
+  const r = await sbCall('GET','/rest/v1/leagues?select=id&limit=1');
+  mpLoading=false;
+  if(!Array.isArray(r.json)){ mpStatus=sbFail(r.status); render(); return; }
+  await store.set(KEY_MPCFG, JSON.stringify(MP));
+  mpStatus='\u2713 connected!'; mpScreen='home'; render();
 }
 async function mpCreateLeague(){
   const ln = ($('cLeague')&&$('cLeague').value.trim())||'Demon Myths League';
@@ -601,10 +617,17 @@ async function mpCreateLeague(){
     lastRecordId:null, armed:false, scoredKeys:[],
     events:[{source:'note',player:'',team:'',pts:0,txt:'League created \u2014 share code '+code+' with your friends',video:null,when:nowStr()}],
     lastSync:null, faUsedOn:{}, trades:[], syncLock:null, updatedAt:nowStr() };
-  const r = await sbCall('POST','/rest/v1/leagues',{id:code, rev:1, data:doc});
+  let r=null, tries=0;
+  while(tries++<3){
+    r = await sbCall('POST','/rest/v1/leagues',{id:doc.code, rev:1, data:doc});
+    if((Array.isArray(r.json)&&r.json.length) || r.status===201) break;
+    if(r.status===409){ doc.code = leagueCode(); doc.events[0].txt='League created \u2014 share code '+doc.code+' with your friends'; continue; }
+    break;
+  }
+  const code2 = doc.code;
   mpLoading=false;
-  if(!(Array.isArray(r.json)&&r.json.length) && r.status!==201){ mpStatus='couldn\u2019t create the league \u2014 check the setup steps below (status '+r.status+')'; render(); return; }
-  mpSession = {leagueId:code, memberId, username:un.slice(0,16)};
+  if(!(Array.isArray(r.json)&&r.json.length) && r.status!==201){ mpStatus='couldn\u2019t create the league: '+sbFail(r.status); render(); return; }
+  mpSession = {leagueId:code2, memberId, username:un.slice(0,16)};
   await store.set(KEY_MPSES, JSON.stringify(mpSession));
   mpRev = 1; game = doc; mpStatus=''; tab='league'; render();
 }
@@ -616,7 +639,7 @@ async function mpJoinLeague(){
   mpLoading=true; mpStatus='joining\u2026'; render();
   const memberId = 'm'+Math.random().toString(36).slice(2,9);
   const row = await mpFetchLeague(code);
-  if(!row){ mpLoading=false; mpStatus = row===false?'no league with that code':'can\u2019t reach the league server'; render(); return; }
+  if(!row){ mpLoading=false; mpStatus = row===false?'no league with that code \u2014 codes look like DM7Q2X':sbFail(0); render(); return; }
   mpRev = row.rev; game = row.data; game.mode='multi';
   mpSession = {leagueId:code, memberId, username:un.slice(0,16)}; // needed for the write below
   const ok = await mpMutate((doc)=>{
