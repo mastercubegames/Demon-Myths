@@ -92,7 +92,7 @@ const store = {
   async del(k){ try{ if(window.storage){await window.storage.delete(k); return;} }catch(e){}
     try{ if(!window.storage && window.localStorage) localStorage.removeItem(k); }catch(e){} },
 };
-const KEY_SAVE='dm3:save', KEY_DATA='dm3:data';
+const KEY_SAVE='dm3:save', KEY_DATA='dm3:data', KEY_MPCFG='dmmp:cfg', KEY_MPSES='dmmp:ses';
 
 // ---------- constants ----------
 const PC = 'https://pointercrate.com/api';
@@ -121,16 +121,31 @@ let dropSel = null;
 let editGd = null;         // pid whose GD name is being edited
 let syncing = false;
 let syncMsg = '';
+let mode = 'solo';         // 'solo' | 'multi'
+let soloGameCache = null;  // parked solo league while in friends mode
+let MP = null;             // {url, key} supabase config
+let mpSession = null;      // {leagueId, memberId, username}
+let mpRev = 0;             // league row revision (optimistic concurrency)
+let mpScreen = 'connect';  // connect|home|create|join|login
+let mpLoading = false;
+let mpStatus = '';
+let mpLoginPickId = null;
+let tradeDraft = null;     // {toSlot, give:[], get:[]}
+let syncDelta = null;      // capture of sync results for conflict-safe merge
 
 // ---------- fetch layer ----------
-async function tryFetchRaw(url, ms){
+async function tryFetchRaw(url, ms, opts){
   const c = new AbortController(); const t = setTimeout(()=>c.abort(), ms||8000);
   try{
-    const res = await fetch(url, {signal:c.signal, headers:{'Accept':'application/json'}});
+    const init = {signal:c.signal, headers: Object.assign({'Accept':'application/json'}, (opts&&opts.headers)||{})};
+    if(opts&&opts.method) init.method = opts.method;
+    if(opts&&opts.body!==undefined){ init.body = JSON.stringify(opts.body); init.headers['Content-Type']='application/json'; }
+    const res = await fetch(url, init);
     clearTimeout(t);
-    if(!res.ok) return {json:null, link:null, status:res.status};
     let link = null; try{ link = res.headers && res.headers.get && res.headers.get('Link'); }catch(e){}
-    return {json: await res.json(), link, status:res.status};
+    if(!res.ok) return {json:null, link:link, status:res.status};
+    let j = null; try{ j = await res.json(); }catch(e){ j = null; }
+    return {json:j, link:link, status:res.status};
   }catch(e){ clearTimeout(t); return {json:null, link:null, status:0}; }
 }
 async function tryFetchJSON(url, ms){ return (await tryFetchRaw(url,ms)).json; }
@@ -205,8 +220,25 @@ const linkGDB = (n)=>'https://gdbrowser.com/u/'+encodeURIComponent(n);
 const LINK_PC = 'https://pointercrate.com/demonlist/statsviewer/';
 
 // ---------- game setup ----------
-async function persistGame(){ try{ await store.set(KEY_SAVE, JSON.stringify(game)); }catch(e){} }
+async function persistGame(){ if(game && game.mode==='multi') return; try{ await store.set(KEY_SAVE, JSON.stringify(game)); }catch(e){} }
 const gp = (id)=> game.players.find(p=>p.id===id);
+function mySlot(){ if(!game) return -1;
+  if(game.mode==='multi') return game.teams.findIndex(t=>t.ownerId===(mpSession&&mpSession.memberId));
+  return game.userSlot; }
+function isMine(t){ return (game&&game.mode==='multi') ? (t.ownerId===(mpSession&&mpSession.memberId)) : !!t.isUser; }
+function ownerName(t){ if(!game||game.mode!=='multi'||!t.ownerId) return null;
+  const m=(game.members||[]).find(x=>x.id===t.ownerId); return m?m.name:null; }
+function faUsedToday(){ if(!game) return false;
+  if(game.mode==='multi') return !!(game.faUsedOn && typeof game.faUsedOn==='object' && mpSession && game.faUsedOn[mpSession.memberId]===today());
+  return game.faUsedOn===today(); }
+function markFaUsed(){ if(game.mode==='multi'){ if(!game.faUsedOn||typeof game.faUsedOn!=='object') game.faUsedOn={}; if(mpSession) game.faUsedOn[mpSession.memberId]=today(); } else game.faUsedOn=today(); }
+const deepClone = (o)=> JSON.parse(JSON.stringify(o));
+function draftTurnLabel(myTurn){
+  if(myTurn) return 'Your pick \u2014 tap a player';
+  const t = game.teams[game.order[game.pickIdx]];
+  if(game.mode==='multi'){ const nm = t ? ownerName(t) : null;
+    return nm ? ('Waiting for '+nm+'\u2026 auto-refreshes') : 'CPU picking\u2026'; }
+  return 'CPU thinking\u2026'; }
 const rosteredPids = ()=> game.teams.flatMap(t=>t.roster);
 function pidByName(name){
   const n = String(name||'').toLowerCase();
@@ -235,6 +267,7 @@ function startDraft(){
 function cpuChoose(){ let best=game.pool[0], bv=-1;
   game.pool.forEach(id=>{ const v=draftValue(gp(id))+Math.random()*9; if(v>bv){bv=v;best=id;} }); return best; }
 function runCpuPicks(){
+  if(game.mode==='multi') return;
   while(game.pickIdx<game.order.length && game.order[game.pickIdx]!==game.userSlot){
     const tId=game.order[game.pickIdx]; const pid=cpuChoose();
     game.teams[tId].roster.push(pid); game.pool=game.pool.filter(x=>x!==pid);
@@ -244,17 +277,24 @@ function runCpuPicks(){
   if(game.pickIdx>=game.order.length){ game.phase='live'; }
 }
 function userPick(pid){
-  if(game.phase!=='draft'||game.order[game.pickIdx]!==game.userSlot||!game.pool.includes(pid)) return;
+  if(!game || game.phase!=='draft' || game.order[game.pickIdx]!==mySlot() || !game.pool.includes(pid)) return;
+  if(game.mode==='multi'){ mpUserPick(pid); return; }
   game.teams[game.userSlot].roster.push(pid); game.pool=game.pool.filter(x=>x!==pid);
   game.draftLog.unshift({team:game.teams[game.userSlot].name, player:gp(pid).name, n:game.pickIdx+1, you:true});
   game.pickIdx++; runCpuPicks(); persistGame(); render();
 }
 function doSwap(addId){
-  if(dropSel==null || game.faUsedOn===today() || !game.pool.includes(addId)) return;
-  const me = game.teams[game.userSlot];
+  if(dropSel==null || faUsedToday() || !game.pool.includes(addId)) return;
+  const ms = mySlot(); if(ms<0) return;
+  const me = game.teams[ms];
+  if(!me.roster.includes(dropSel)) return;
   me.roster = me.roster.filter(x=>x!==dropSel).concat(addId);
   game.pool = game.pool.filter(x=>x!==addId).concat(dropSel);
-  game.faUsedOn = today(); dropSel=null; persistGame(); render();
+  markFaUsed();
+  addEvent({source:'note', player:'', team:me.name, pts:0, txt:me.name+' signs '+gp(addId).name+' and releases '+gp(dropSel).name, video:null});
+  dropSel=null;
+  if(game.mode==='multi'){ mpPushLive(); } else { persistGame(); }
+  render();
 }
 
 // ---------- event bookkeeping ----------
@@ -262,15 +302,19 @@ function addEvent(ev){ // {source, player, txt, pts, video}
   ev.when = nowStr();
   game.events.unshift(ev);
   if(game.events.length>250) game.events.length = 250;
+  if(syncDelta) syncDelta.newEvents.push(ev);
 }
 function award(pid, pts, ev){
   const p = gp(pid); const t = teamOf(pid);
-  if(pts>0){ p.pts += pts; if(t) t.pts += pts; }
+  if(pts>0){ p.pts += pts; if(t) t.pts += pts;
+    if(syncDelta && t) syncDelta.teamPtsDelta[t.id] = (syncDelta.teamPtsDelta[t.id]||0) + pts; }
   ev.pts = pts; ev.player = p.name; ev.team = t ? t.name : '';
   addEvent(ev);
 }
 function seenKey(k){ k=k.toLowerCase(); if(game.scoredKeys.includes(k)) return true;
-  game.scoredKeys.push(k); if(game.scoredKeys.length>500) game.scoredKeys.shift(); return false; }
+  game.scoredKeys.push(k); if(game.scoredKeys.length>500) game.scoredKeys.shift();
+  if(syncDelta) syncDelta.newKeys.push(k);
+  return false; }
 
 // ---------- pointercrate record tracking ----------
 async function findMaxRecordId(){
@@ -403,8 +447,15 @@ async function syncGDProfiles(){
 async function syncScores(){
   if(!game || game.phase!=='live' || syncing) return;
   syncing = true; syncMsg='starting\u2026'; render();
-  let usedAPI = false;
+  let usedAPI = false; let locked = false; let delta = null;
   try{
+    if(game.mode==='multi'){
+      syncMsg='locking the league so checks don\u2019t double-count\u2026'; renderSyncBar();
+      locked = await mpAcquireLock();
+      if(!locked){ return; }
+      delta = {newEvents:[], teamPtsDelta:{}, newKeys:[]};
+      syncDelta = delta;
+    }
     // 1) pointercrate reachable?
     syncMsg='contacting pointercrate\u2026'; renderSyncBar();
     if(!game.armed || game.lastRecordId==null){
@@ -433,7 +484,7 @@ async function syncScores(){
       // 3) refresh the board
       const fresh = await loadFromAPI();
       if(fresh){ DATA=fresh; await store.set(KEY_DATA, JSON.stringify(fresh)); }
-      // 4) GD profiles via GDBrowser
+      // 4) GD profiles via GDBrowser (through the relay)
       await syncGDProfiles();
     } else {
       // pointercrate unreachable this time — nothing is scored, nothing invented
@@ -441,7 +492,14 @@ async function syncScores(){
     }
     game.lastSync = nowStr();
   } finally {
-    syncing=false; syncMsg=''; tab='scores'; await persistGame(); render();
+    syncDelta = null;
+    if(game && game.mode==='multi' && locked){
+      syncMsg='saving results to the league\u2026'; renderSyncBar();
+      await mpFinishSync(delta||{newEvents:[],teamPtsDelta:{},newKeys:[]});
+    }
+    syncing=false; syncMsg=''; tab='scores';
+    if(game && game.mode!=='multi') await persistGame();
+    render();
   }
 }
 
@@ -449,10 +507,298 @@ function setGdName(pid){
   const inp = $('gdin_'+pid); if(!inp) return;
   const p = gp(pid); const v = inp.value.trim();
   if(v){ p.gdName=v; p.gdDemons=null; p.gdStatus=null; }
-  editGd=null; persistGame(); render();
+  editGd=null;
+  if(game.mode==='multi'){ mpPushLive(); } else { persistGame(); }
+  render();
 }
 
-async function resetAll(){ await store.del(KEY_SAVE); game=null; confirmReset=false; tab='league'; dropSel=null; editGd=null; render(); }
+async function resetAll(){
+  confirmReset=false;
+  if(mode==='multi'){
+    mpSession=null; try{ await store.del(KEY_MPSES); }catch(e){}
+    game=null; tradeDraft=null; mpLoginPickId=null; window.__mpLoginRow=null;
+    mpScreen='home'; mpStatus='logged out on this device \u2014 the league itself is untouched';
+    tab='league'; render(); return;
+  }
+  await store.del(KEY_SAVE); game=null; tab='league'; dropSel=null; editGd=null; render();
+}
+
+// ==================== FRIENDS LEAGUE (Supabase) ====================
+// One shared JSON doc per league in a `leagues` table:
+//   id text primary key, rev bigint, data jsonb
+// Every write is conditional on `rev` (optimistic concurrency), so two
+// friends can never silently overwrite each other. Accounts are a
+// username + 4-digit PIN per league (lightly hashed — it's a game, so
+// don't reuse a real password).
+const pinHash = (name,pin)=> hashStr(String(name).toLowerCase()+'|'+String(pin)).toString(36);
+const leagueCode = ()=>{ const A='ABCDEFGHJKMNPQRSTUVWXYZ23456789'; let c='DM';
+  for(let i=0;i<4;i++) c+=A[Math.floor(Math.random()*A.length)]; return c; };
+
+function sbHeaders(){ return {apikey:MP.key, 'Authorization':'Bearer '+MP.key, 'Prefer':'return=representation'}; }
+async function sbCall(method, path, body){
+  if(!MP || !MP.url || !MP.key) return {json:null,status:0};
+  const base = MP.url.replace(/\/+$/,'');
+  return await tryFetchRaw(base+path, 10000, {method, headers:sbHeaders(), body});
+}
+async function mpFetchLeague(id){
+  const r = await sbCall('GET','/rest/v1/leagues?id=eq.'+encodeURIComponent(id)+'&select=*');
+  if(Array.isArray(r.json) && r.json.length) return r.json[0];
+  return (r.status===200 || r.status===206) ? false : null; // false = not found, null = network/config problem
+}
+async function mpPush(doc){
+  doc.updatedAt = nowStr();
+  const r = await sbCall('PATCH','/rest/v1/leagues?id=eq.'+encodeURIComponent(mpSession.leagueId)+'&rev=eq.'+mpRev,
+    {data:doc, rev:mpRev+1});
+  if(Array.isArray(r.json) && r.json.length===1){ mpRev++; return true; }
+  return false;
+}
+async function mpRefresh(silent){
+  if(!mpSession) return false;
+  const row = await mpFetchLeague(mpSession.leagueId);
+  if(!row){ if(!silent){ mpStatus = row===false ? 'league not found \u2014 was it deleted?' : 'can\u2019t reach the league server'; } return false; }
+  const changed = row.rev !== mpRev || !game;
+  mpRev = row.rev; game = row.data; game.mode='multi';
+  return changed;
+}
+async function mpMutate(fn, tries){
+  // fetch-fresh -> mutate -> conditional push, retried on conflicts
+  for(let i=0;i<(tries||4);i++){
+    const ok0 = await mpRefresh(true); if(game==null) return false;
+    const doc = deepClone(game); doc.mode='multi';
+    const res = fn(doc);
+    if(res===false) return false; // mutation no longer valid
+    if(await mpPush(doc)){ game = doc; return true; }
+  }
+  mpStatus='the league was busy \u2014 try again'; return false;
+}
+
+async function mpSaveCfg(){
+  const u = ($('mpUrl')&&$('mpUrl').value.trim())||''; const k = ($('mpKey')&&$('mpKey').value.trim())||'';
+  if(!/^https:\/\/.+supabase\./.test(u) || k.length<20){ mpStatus='that doesn\u2019t look like a Supabase URL + anon key yet'; render(); return; }
+  MP = {url:u, key:k}; await store.set(KEY_MPCFG, JSON.stringify(MP));
+  mpStatus=''; mpScreen='home'; render();
+}
+async function mpCreateLeague(){
+  const ln = ($('cLeague')&&$('cLeague').value.trim())||'Demon Myths League';
+  const un = ($('cUser')&&$('cUser').value.trim())||''; const pin = ($('cPin')&&$('cPin').value.trim())||'';
+  const tn = ($('cTeam')&&$('cTeam').value.trim())||(un?un+"'s Squad":'');
+  if(un.length<2 || pin.length<4){ mpStatus='pick a username and a PIN of at least 4 digits'; render(); return; }
+  mpLoading=true; mpStatus='creating league\u2026'; render();
+  const src = DATA || SNAPSHOT;
+  const memberId = 'm'+Math.random().toString(36).slice(2,9);
+  const code = leagueCode();
+  const players = src.players.slice(0,40).map(mkPlayer);
+  const doc = { mode:'multi', phase:'lobby', leagueName:ln.slice(0,30), code, createdAt:today(), startedAt:null,
+    members:[{id:memberId, name:un.slice(0,16), pinH:pinHash(un,pin), team:tn.slice(0,24)||'Squad'}],
+    teams:[], players, pool:players.map(p=>p.id), rounds:0, order:[], pickIdx:0, draftLog:[],
+    demons:src.demons, knownDemons:src.demons.map(d=>String(d.name).toLowerCase()), 
+    dataSource:src.source, dataUpdated:src.updated,
+    lastRecordId:null, armed:false, scoredKeys:[],
+    events:[{source:'note',player:'',team:'',pts:0,txt:'League created \u2014 share code '+code+' with your friends',video:null,when:nowStr()}],
+    lastSync:null, faUsedOn:{}, trades:[], syncLock:null, updatedAt:nowStr() };
+  const r = await sbCall('POST','/rest/v1/leagues',{id:code, rev:1, data:doc});
+  mpLoading=false;
+  if(!(Array.isArray(r.json)&&r.json.length) && r.status!==201){ mpStatus='couldn\u2019t create the league \u2014 check the setup steps below (status '+r.status+')'; render(); return; }
+  mpSession = {leagueId:code, memberId, username:un.slice(0,16)};
+  await store.set(KEY_MPSES, JSON.stringify(mpSession));
+  mpRev = 1; game = doc; mpStatus=''; tab='league'; render();
+}
+async function mpJoinLeague(){
+  const code = (($('jCode')&&$('jCode').value.trim())||'').toUpperCase();
+  const un = ($('jUser')&&$('jUser').value.trim())||''; const pin = ($('jPin')&&$('jPin').value.trim())||'';
+  const tn = ($('jTeam')&&$('jTeam').value.trim())||(un?un+"'s Squad":'');
+  if(!code || un.length<2 || pin.length<4){ mpStatus='need the league code, a username, and a 4+ digit PIN'; render(); return; }
+  mpLoading=true; mpStatus='joining\u2026'; render();
+  const memberId = 'm'+Math.random().toString(36).slice(2,9);
+  const row = await mpFetchLeague(code);
+  if(!row){ mpLoading=false; mpStatus = row===false?'no league with that code':'can\u2019t reach the league server'; render(); return; }
+  mpRev = row.rev; game = row.data; game.mode='multi';
+  mpSession = {leagueId:code, memberId, username:un.slice(0,16)}; // needed for the write below
+  const ok = await mpMutate((doc)=>{
+    if(doc.phase!=='lobby'){ mpStatus='that league already drafted \u2014 ask them to log you in as a spectator next season'; return false; }
+    if(doc.members.length>=4){ mpStatus='that league is full (4 max)'; return false; }
+    if(doc.members.some(m=>m.name.toLowerCase()===un.toLowerCase())){ mpStatus='that username is taken in this league'; return false; }
+    doc.members.push({id:memberId, name:un.slice(0,16), pinH:pinHash(un,pin), team:tn.slice(0,24)||'Squad'});
+    doc.events.unshift({source:'note',player:'',team:'',pts:0,txt:un+' joined the league',video:null,when:nowStr()});
+    return true;
+  });
+  mpLoading=false;
+  if(!ok){ mpSession=null; game=null; render(); return; }
+  await store.set(KEY_MPSES, JSON.stringify(mpSession));
+  mpStatus=''; tab='league'; render();
+}
+async function mpLogin(){
+  const code = (($('lCode')&&$('lCode').value.trim())||'').toUpperCase();
+  const pin = ($('lPin')&&$('lPin').value.trim())||'';
+  mpLoading=true; mpStatus='looking up league\u2026'; render();
+  const row = await mpFetchLeague(code);
+  mpLoading=false;
+  if(!row){ mpStatus = row===false?'no league with that code':'can\u2019t reach the league server'; render(); return; }
+  if(!mpLoginPickId){ mpRev=row.rev; game=null; window.__mpLoginRow = row; mpStatus='pick your name and enter your PIN'; render(); return; }
+  const m = row.data.members.find(x=>x.id===mpLoginPickId);
+  if(!m || m.pinH!==pinHash(m.name,pin)){ mpStatus='wrong PIN'; window.__mpLoginRow=row; render(); return; }
+  mpSession = {leagueId:code, memberId:m.id, username:m.name};
+  await store.set(KEY_MPSES, JSON.stringify(mpSession));
+  mpRev = row.rev; game = row.data; game.mode='multi';
+  window.__mpLoginRow=null; mpLoginPickId=null; mpStatus=''; tab='league'; render();
+}
+async function mpStartDraft(){
+  mpLoading=true; mpStatus='building the draft\u2026'; render();
+  const ok = await mpMutate((doc)=>{
+    if(doc.phase!=='lobby') return false;
+    if(!mpSession || doc.members[0].id!==mpSession.memberId){ mpStatus='only the league creator can start the draft'; return false; }
+    const humans = doc.members.map(m=>({name:m.team, ownerId:m.id}));
+    const cpus = [...CPU_NAMES].sort(()=>Math.random()-0.5).slice(0, Math.max(0,4-humans.length)).map(n=>({name:n, ownerId:null}));
+    const slots = [...humans, ...cpus].sort(()=>Math.random()-0.5);
+    doc.teams = slots.map((t,i)=>({id:i, name:t.name, ownerId:t.ownerId, roster:[], pts:0}));
+    doc.rounds = Math.max(3, Math.min(6, Math.floor(doc.players.length/4)));
+    doc.order = []; for(let rd=0; rd<doc.rounds; rd++){ doc.order.push(...(rd%2===0?[0,1,2,3]:[3,2,1,0])); }
+    doc.pickIdx = 0; doc.draftLog = []; doc.phase = 'draft'; doc.startedAt = today();
+    doc.events.unshift({source:'note',player:'',team:'',pts:0,txt:'The draft has begun!',video:null,when:nowStr()});
+    return true;
+  });
+  mpLoading=false;
+  if(ok){ mpStatus=''; render(); mpCpuAdvance(); } else render();
+}
+function applyCpuPickTo(doc){
+  const slot = doc.order[doc.pickIdx]; const t = doc.teams[slot];
+  let best=doc.pool[0], bv=-1;
+  const dv=(pid)=>{ const p=doc.players.find(x=>x.id===pid); return Math.round(clamp(99-(p.rank-1)*0.36,62,99)); };
+  doc.pool.forEach(id=>{ const v=dv(id)+Math.random()*9; if(v>bv){bv=v;best=id;} });
+  t.roster.push(best); doc.pool = doc.pool.filter(x=>x!==best);
+  const pl = doc.players.find(x=>x.id===best);
+  doc.draftLog.unshift({team:t.name, player:pl.name, n:doc.pickIdx+1});
+  doc.pickIdx++;
+  if(doc.pickIdx>=doc.order.length){ doc.phase='live';
+    doc.events.unshift({source:'note',player:'',team:'',pts:0,txt:'Draft complete \u2014 hit \u21BB CHECK RECORDS to arm real tracking',video:null,when:nowStr()}); }
+}
+async function mpCpuAdvance(){
+  let guard=0;
+  while(guard++<30){
+    if(!game || game.mode!=='multi' || game.phase!=='draft') return;
+    const slot = game.order[game.pickIdx];
+    if(game.teams[slot] && game.teams[slot].ownerId) return; // human turn
+    const done = await mpMutate((doc)=>{
+      if(doc.phase!=='draft') return false;
+      const s2 = doc.order[doc.pickIdx];
+      if(doc.teams[s2] && doc.teams[s2].ownerId) return false; // someone else advanced it
+      applyCpuPickTo(doc);
+      return true;
+    }, 2);
+    render();
+    if(!done) return;
+  }
+}
+async function mpUserPick(pid){
+  mpLoading=true; render();
+  await mpMutate((doc)=>{
+    if(doc.phase!=='draft') return false;
+    const slot = doc.order[doc.pickIdx];
+    if(!doc.teams[slot] || doc.teams[slot].ownerId!==mpSession.memberId) return false;
+    if(!doc.pool.includes(pid)) return false;
+    doc.teams[slot].roster.push(pid); doc.pool = doc.pool.filter(x=>x!==pid);
+    const pl = doc.players.find(x=>x.id===pid);
+    doc.draftLog.unshift({team:doc.teams[slot].name, player:pl.name, n:doc.pickIdx+1, you:true});
+    doc.pickIdx++;
+    if(doc.pickIdx>=doc.order.length){ doc.phase='live';
+      doc.events.unshift({source:'note',player:'',team:'',pts:0,txt:'Draft complete \u2014 hit \u21BB CHECK RECORDS to arm real tracking',video:null,when:nowStr()}); }
+    return true;
+  });
+  mpLoading=false; render(); mpCpuAdvance();
+}
+async function mpPushLive(){
+  // push current local game (used after small owned mutations: swaps, gd names)
+  const snapshot = deepClone(game);
+  if(await mpPush(snapshot)){ game=snapshot; return true; }
+  // conflict: re-apply is complex for tiny edits; just refetch (the edit is lost, user can redo)
+  await mpRefresh(true); mpStatus='league updated by someone else \u2014 try that again'; render(); return false;
+}
+
+// ---- trades ----
+function myPendingTrades(){ const ms=mySlot();
+  return (game.trades||[]).filter(t=>t.status==='pending' && (t.toSlot===ms || t.fromSlot===ms)); }
+async function mpSendTrade(){
+  if(!tradeDraft || tradeDraft.toSlot==null || !tradeDraft.give.length || !tradeDraft.get.length) return;
+  const td = tradeDraft;
+  mpLoading=true; render();
+  const ok = await mpMutate((doc)=>{
+    const ms = doc.teams.findIndex(t=>t.ownerId===mpSession.memberId); if(ms<0) return false;
+    const give = td.give.filter(p=>doc.teams[ms].roster.includes(p));
+    const get = td.get.filter(p=>doc.teams[td.toSlot].roster.includes(p));
+    if(!give.length || !get.length){ mpStatus='those players moved \u2014 rebuild the trade'; return false; }
+    doc.trades = doc.trades||[];
+    doc.trades.unshift({id:'t'+Math.random().toString(36).slice(2,8), fromSlot:ms, toSlot:td.toSlot,
+      give, get, by:mpSession.username, at:nowStr(), status:'pending'});
+    if(doc.trades.length>40) doc.trades.length=40;
+    return true;
+  });
+  mpLoading=false;
+  if(ok){ tradeDraft=null; mpStatus=''; }
+  render();
+}
+async function mpRespondTrade(id, accept){
+  mpLoading=true; render();
+  await mpMutate((doc)=>{
+    const tr = (doc.trades||[]).find(t=>t.id===id);
+    if(!tr || tr.status!=='pending') return false;
+    const ms = doc.teams.findIndex(t=>t.ownerId===mpSession.memberId);
+    if(tr.toSlot!==ms) return false;
+    if(!accept){ tr.status='declined'; return true; }
+    const A = doc.teams[tr.fromSlot], B = doc.teams[tr.toSlot];
+    if(!tr.give.every(p=>A.roster.includes(p)) || !tr.get.every(p=>B.roster.includes(p))){ tr.status='void'; return true; }
+    A.roster = A.roster.filter(p=>!tr.give.includes(p)).concat(tr.get);
+    B.roster = B.roster.filter(p=>!tr.get.includes(p)).concat(tr.give);
+    tr.status='accepted';
+    const nm=(pid)=>{ const p=doc.players.find(x=>x.id===pid); return p?p.name:'?'; };
+    doc.events.unshift({source:'trade',player:'',team:'',pts:0,
+      txt:'TRADE: '+A.name+' sends '+tr.give.map(nm).join(', ')+' to '+B.name+' for '+tr.get.map(nm).join(', '),video:null,when:nowStr()});
+    return true;
+  });
+  mpLoading=false; render();
+}
+async function mpCancelTrade(id){
+  mpLoading=true; render();
+  await mpMutate((doc)=>{
+    const tr=(doc.trades||[]).find(t=>t.id===id);
+    const ms = doc.teams.findIndex(t=>t.ownerId===mpSession.memberId);
+    if(!tr || tr.status!=='pending' || tr.fromSlot!==ms) return false;
+    tr.status='cancelled'; return true;
+  });
+  mpLoading=false; render();
+}
+
+// ---- sync lock + conflict-safe finish ----
+async function mpAcquireLock(){
+  for(let i=0;i<3;i++){
+    await mpRefresh(true); if(!game) return false;
+    const L = game.syncLock;
+    if(L && L.by!==mpSession.memberId && (Date.now()-(L.at||0))<180000){
+      mpStatus=(L.name||'someone')+' is already checking records \u2014 refresh in a moment'; return false; }
+    const doc = deepClone(game);
+    doc.syncLock = {by:mpSession.memberId, name:mpSession.username, at:Date.now()};
+    if(await mpPush(doc)){ game=doc; return true; }
+  }
+  return false;
+}
+async function mpFinishSync(delta){
+  const localG = game;
+  for(let i=0;i<4;i++){
+    const doc = deepClone(game); doc.syncLock=null;
+    if(await mpPush(doc)){ game=doc; return true; }
+    const row = await mpFetchLeague(mpSession.leagueId);
+    if(!row) return false;
+    mpRev = row.rev;
+    const base = row.data; base.mode='multi';
+    base.players = localG.players; base.demons = localG.demons; base.knownDemons = localG.knownDemons;
+    base.lastRecordId = localG.lastRecordId; base.armed = localG.armed; base.lastSync = localG.lastSync;
+    base.scoredKeys = Array.from(new Set([...(base.scoredKeys||[]), ...delta.newKeys])).slice(-500);
+    base.events = [...delta.newEvents, ...(base.events||[])].slice(0,250);
+    Object.keys(delta.teamPtsDelta).forEach(k=>{ if(base.teams[k]) base.teams[k].pts += delta.teamPtsDelta[k]; });
+    base.syncLock = null;
+    game = base;
+  }
+  return false;
+}
 
 // ---------- svg + small views ----------
 function demonFace(color,size){
@@ -472,6 +818,7 @@ const srcBadge = (s)=> s==='record'?'<span class="mono" style="color:var(--live)
   : s==='gd'?'<span class="mono" style="color:var(--live);font-size:10px">\u25CF GD PROFILE</span>'
   : s==='ai'?'<span class="mono" style="color:var(--easy);font-size:10px">\u2726 AI-FOUND</span>'
   : s==='list'?'<span class="mono" style="color:var(--gold);font-size:10px">\u25C6 LIST NEWS</span>'
+  : s==='trade'?'<span class="mono" style="color:var(--easy);font-size:10px">\u21C4 TRADE</span>'
   : '<span class="mono" style="color:var(--dim);font-size:10px">\u00B7</span>';
 
 function renderBoot(){
@@ -541,6 +888,102 @@ function render(){
   const app = $('app');
   let html='';
 
+  // ---------- friends mode: pre-league screens ----------
+  if(mode==='multi' && (!game || game.phase==='lobby')){
+    html = headerHTML() + '<div class="wrap" style="max-width:520px;padding-bottom:90px">';
+    const status = mpStatus ? '<div class="chip" style="margin:8px 0;color:var(--med)">'+esc(mpStatus)+'</div>' : '';
+    const busy = mpLoading ? '<div class="mono" style="color:var(--dim);font-size:12px;margin:8px 0"><span class="spinner"></span>&nbsp; working\u2026</div>' : '';
+
+    if(game && game.phase==='lobby'){
+      const creator = game.members[0] && mpSession && game.members[0].id===mpSession.memberId;
+      html += '<div class="panel" style="text-align:center;margin-top:8px">'
+       + '<div class="display" style="font-size:22px">'+esc(game.leagueName||'League')+'</div>'
+       + '<div style="color:var(--dim);font-size:13px;margin:4px 0 10px">share this code with your friends:</div>'
+       + '<div class="display" style="font-size:38px;color:var(--gold);letter-spacing:4px">'+esc(game.code)+'</div>'
+       + '<div style="color:var(--dim);font-size:12px;margin-top:6px">they open your site \u2192 friends \u2192 JOIN \u2192 enter the code</div></div>'
+       + '<div class="panel" style="margin-top:12px"><div style="font-size:12px;letter-spacing:1px;color:var(--dim);margin-bottom:6px">MANAGERS \u00B7 '+game.members.length+'/4</div>'
+       + game.members.map((m,i)=>'<div class="row"><div class="display" style="width:22px;color:var(--dim)">'+(i+1)+'</div>'
+          + '<div style="flex:1"><b>'+esc(m.name)+'</b>'+(mpSession&&m.id===mpSession.memberId?' <span style="color:var(--gold);font-size:11px">YOU</span>':'')
+          + '<div style="font-size:12px;color:var(--dim)">'+esc(m.team)+'</div></div>'
+          + (i===0?'<span class="mono" style="font-size:10px;color:var(--gold)">CREATOR</span>':'')+'</div>').join('')
+       + '</div>'
+       + status + busy
+       + (creator
+          ? '<button class="bigbtn" data-a="mpStartDraft" style="margin-top:12px" '+(mpLoading?'disabled':'')+'>START THE DRAFT</button>'
+            + '<div style="color:var(--dim);font-size:12px;text-align:center;margin-top:8px">empty slots become CPU squads \u00B7 draft order is randomized</div>'
+          : '<div class="panel" style="margin-top:12px;text-align:center;color:var(--dim);font-size:14px">Waiting for <b style="color:var(--text)">'+esc(game.members[0]?game.members[0].name:'the creator')+'</b> to start the draft\u2026 this screen auto-refreshes.</div>');
+      html += '</div>';
+      app.innerHTML = html; if(confirmReset) app.innerHTML+=resetHTML();
+      return;
+    }
+
+    if(!MP || mpScreen==='connect'){
+      html += '<div class="panel" style="margin-top:8px"><div class="display" style="font-size:20px;color:var(--gold)">FRIENDS LEAGUE \u00B7 SETUP</div>'
+       + '<div style="color:var(--dim);font-size:13.5px;line-height:1.55;margin:8px 0">Shared leagues need a tiny free database (GitHub Pages can\u2019t store shared stuff). One person \u2014 probably you \u2014 sets it up once, and every friend just uses your site normally:</div>'
+       + '<div style="color:var(--dim);font-size:13.5px;line-height:1.7">1. Go to <b style="color:var(--text)">supabase.com</b> \u2192 sign up \u2192 New project (free)<br>'
+       + '2. In the project: <b style="color:var(--text)">SQL Editor</b> \u2192 paste this \u2192 Run:</div>'
+       + '<pre class="mono" style="background:rgba(0,0,0,.35);border:1px solid var(--line);border-radius:10px;padding:10px;font-size:11px;overflow-x:auto;color:var(--live)">'
+       + 'create table if not exists leagues (\\n  id text primary key,\\n  rev bigint not null default 1,\\n  data jsonb not null\\n);\\n'
+       + 'alter table leagues enable row level security;\\n'
+       + 'create policy "league open" on leagues\\n  for all using (true) with check (true);</pre>'
+       + '<div style="color:var(--dim);font-size:13.5px;line-height:1.7">3. <b style="color:var(--text)">Settings \u2192 API</b>: copy the <b style="color:var(--text)">Project URL</b> and the <b style="color:var(--text)">anon public</b> key, paste them here:</div>'
+       + '<div style="display:grid;gap:8px;margin-top:10px">'
+       + '<input id="mpUrl" type="text" placeholder="https://xxxx.supabase.co" value="'+esc(MP?MP.url:'')+'"/>'
+       + '<input id="mpKey" type="text" placeholder="anon public key (long text)" value="'+esc(MP?MP.key:'')+'"/></div>'
+       + status
+       + '<button class="bigbtn" data-a="mpSaveCfg" style="margin-top:10px">SAVE & CONTINUE</button>'
+       + '<div style="color:var(--dim);font-size:11.5px;margin-top:10px">The anon key is made to be public \u2014 it ends up in your site anyway. Anyone with your site link can make leagues there, so only share the link with people you want in.</div>'
+       + '</div></div>';
+      app.innerHTML = html; if(confirmReset) app.innerHTML+=resetHTML();
+      return;
+    }
+
+    if(mpScreen==='home'){
+      html += '<div style="text-align:center;margin-top:10px">'
+       + '<div class="display" style="font-size:30px">FRIENDS <span style="color:var(--gold)">LEAGUE</span></div>'
+       + '<div style="color:var(--dim);font-size:14px;margin:6px 0 16px">Real players. Real records. Real friends to beat.</div></div>'
+       + status + busy
+       + '<button class="bigbtn" data-a="mpGoto" data-id="create">CREATE A LEAGUE</button>'
+       + '<button class="bigbtn" data-a="mpGoto" data-id="join" style="margin-top:10px">JOIN WITH A CODE</button>'
+       + '<button class="bigbtn" data-a="mpGoto" data-id="login" style="margin-top:10px">LOG BACK IN</button>'
+       + '<div style="text-align:center;margin-top:14px"><button class="smbtn" data-a="mpGoto" data-id="connect">server settings</button></div>'
+       + '</div>';
+      app.innerHTML = html; if(confirmReset) app.innerHTML+=resetHTML();
+      return;
+    }
+
+    if(mpScreen==='create' || mpScreen==='join'){
+      const isC = mpScreen==='create';
+      html += '<div class="panel" style="margin-top:8px"><div class="display" style="font-size:20px;color:var(--gold)">'+(isC?'CREATE LEAGUE':'JOIN LEAGUE')+'</div>'
+       + '<div style="display:grid;gap:8px;margin-top:12px">'
+       + (isC ? '<input id="cLeague" type="text" maxlength="30" placeholder="League name\u2026"/>'
+              : '<input id="jCode" type="text" maxlength="8" placeholder="League code (like DM7Q2X)" style="text-transform:uppercase"/>')
+       + '<input id="'+(isC?'cUser':'jUser')+'" type="text" maxlength="16" placeholder="Your username\u2026"/>'
+       + '<input id="'+(isC?'cPin':'jPin')+'" type="text" maxlength="8" placeholder="Make a PIN (4+ digits \u2014 not a real password!)"/>'
+       + '<input id="'+(isC?'cTeam':'jTeam')+'" type="text" maxlength="24" placeholder="Your team name\u2026"/></div>'
+       + status + busy
+       + '<button class="bigbtn" data-a="'+(isC?'mpCreate':'mpJoin')+'" style="margin-top:12px" '+(mpLoading?'disabled':'')+'>'+(isC?'CREATE & GET CODE':'JOIN LEAGUE')+'</button>'
+       + '<div style="text-align:center;margin-top:10px"><button class="smbtn" data-a="mpGoto" data-id="home">\u2190 back</button></div></div></div>';
+      app.innerHTML = html; if(confirmReset) app.innerHTML+=resetHTML();
+      return;
+    }
+
+    if(mpScreen==='login'){
+      const row = window.__mpLoginRow;
+      html += '<div class="panel" style="margin-top:8px"><div class="display" style="font-size:20px;color:var(--gold)">LOG BACK IN</div>'
+       + '<div style="display:grid;gap:8px;margin-top:12px">'
+       + '<input id="lCode" type="text" maxlength="8" placeholder="League code" style="text-transform:uppercase" value="'+esc(row?row.id:'')+'"/>'
+       + (row ? ('<div style="display:flex;gap:6px;flex-wrap:wrap">'
+           + row.data.members.map(m=>'<button class="smbtn" data-a="mpLoginPick" data-id="'+esc(m.id)+'" style="'+(mpLoginPickId===m.id?'border-color:var(--gold);color:var(--gold)':'')+'">'+esc(m.name)+'</button>').join('')
+           + '</div><input id="lPin" type="text" maxlength="8" placeholder="Your PIN"/>') : '')
+       + '</div>' + status + busy
+       + '<button class="bigbtn" data-a="mpLogin" style="margin-top:12px" '+(mpLoading?'disabled':'')+'>'+(row?'LOG IN':'FIND LEAGUE')+'</button>'
+       + '<div style="text-align:center;margin-top:10px"><button class="smbtn" data-a="mpGoto" data-id="home">\u2190 back</button></div></div></div>';
+      app.innerHTML = html; if(confirmReset) app.innerHTML+=resetHTML();
+      return;
+    }
+  }
+
   if(!game){
     html = headerHTML()
      + '<div class="wrap" style="max-width:480px;text-align:center;padding-top:26px;padding-bottom:90px">'
@@ -560,13 +1003,13 @@ function render(){
   }
 
   if(game.phase==='draft'){
-    const myTurn = game.order[game.pickIdx]===game.userSlot;
-    const me = game.teams[game.userSlot];
+    const myTurn = game.order[game.pickIdx]===mySlot();
+    const me = game.teams[mySlot()] || {roster:[], name:'?'};
     html = headerHTML()
      + '<div class="wrap" style="padding-bottom:90px">'
      + '<div class="panel"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">'
      + '<div><div class="display" style="font-size:20px;color:var(--gold)">SNAKE DRAFT</div>'
-     + '<div style="color:var(--dim);font-size:13px">Pick '+Math.min(game.pickIdx+1,game.order.length)+' of '+game.order.length+' \u00B7 '+(myTurn?'Your pick \u2014 tap a player':'CPU thinking\u2026')+'</div></div>'
+     + '<div style="color:var(--dim);font-size:13px">Pick '+Math.min(game.pickIdx+1,game.order.length)+' of '+game.order.length+' \u00B7 '+draftTurnLabel(myTurn)+'</div></div>'
      + '<div style="font-size:13px;color:var(--dim)">Your roster: <b style="color:var(--text)">'+me.roster.length+'/'+game.rounds+'</b></div></div></div>'
      + '<div class="grid" style="margin-top:12px">'
      + game.pool.slice().sort((a,b)=>gp(a).rank-gp(b).rank).map(pid=>playerCardHTML(gp(pid),{clickable:myTurn,action:'pick'})).join('')
@@ -580,13 +1023,15 @@ function render(){
   }
 
   // ---------- live league ----------
-  const me = game.teams[game.userSlot];
+  const me = game.teams[mySlot()] || {roster:[], name:'?', pts:0};
   const standings = [...game.teams].sort((a,b)=>b.pts-a.pts);
   const dayN = Math.max(1, Math.round((Date.now()-new Date(game.startedAt+'T00:00:00').getTime())/86400000)+1);
 
   html = headerHTML() + tickerHTML()
    + '<div class="wrap"><div style="display:flex;gap:6px;padding:10px 0;overflow-x:auto">'
-   + [['league','League'],['scores','Scores'],['team','My Team'],['board','The List'],['rules','Rules']].map(([k,l])=>
+   + (game.mode==='multi'
+      ? [['league','League'],['scores','Scores'],['team','My Team'],['trades','Trades'+(myPendingTrades().filter(t=>t.toSlot===mySlot()).length?' \u25CF':'')],['board','The List'],['rules','Rules']]
+      : [['league','League'],['scores','Scores'],['team','My Team'],['board','The List'],['rules','Rules']]).map(([k,l])=>
       '<button class="tabbtn'+(tab===k?' on':'')+'" data-a="tab" data-id="'+k+'">'+l+'</button>').join('')+'</div>';
 
   if(tab==='league'){
@@ -598,10 +1043,10 @@ function render(){
      + '</div>'
      + '<div id="syncbar" class="mono" style="font-size:12px;color:var(--dim);margin-top:8px">'+(syncing?('<span class="spinner"></span>&nbsp; '+esc(syncMsg)):'')+'</div></div>'
      + '<div class="panel" style="margin-top:12px"><div style="font-size:12px;letter-spacing:1px;color:var(--dim);margin-bottom:8px">STANDINGS \u00B7 REAL POINTS ONLY</div>'
-     + standings.map((t,i)=>'<div class="row" style="'+(t.isUser?'background:rgba(255,210,77,.07);border-radius:8px;':'')+'">'
+     + standings.map((t,i)=>'<div class="row" style="'+(isMine(t)?'background:rgba(255,210,77,.07);border-radius:8px;':'')+'">'
         + '<div class="display" style="width:22px;color:'+(i===0?'var(--gold)':'var(--dim)')+';font-size:16px">'+(i+1)+'</div>'
         + demonFace(['#b44dff','#ff4dd2','#ff5a5a','#ffa04d'][t.id],26)
-        + '<div style="flex:1;min-width:0"><div style="font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(t.name)+(t.isUser?' <span style="color:var(--gold);font-size:11px">YOU</span>':'')+'</div>'
+        + '<div style="flex:1;min-width:0"><div style="font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(t.name)+(isMine(t)?' <span style="color:var(--gold);font-size:11px">YOU</span>':(ownerName(t)?' <span style="color:var(--easy);font-size:11px">@'+esc(ownerName(t))+'</span>':''))+'</div>'
         + '<div style="font-size:12px;color:var(--dim)">'+t.roster.map(pid=>esc(gp(pid).name)).join(', ')+'</div></div>'
         + '<div class="display" style="color:'+(i===0?'var(--gold)':'var(--text)')+';font-size:20px">'+t.pts+'</div></div>').join('')
      + '</div>';
@@ -625,9 +1070,66 @@ function render(){
      + '</div>';
   }
 
+  if(tab==='trades' && game.mode==='multi'){
+    const ms = mySlot();
+    const partners = game.teams.filter(t=>t.ownerId && t.id!==ms);
+    const nm = (pid)=>{ const p=gp(pid); return p?p.name:'?'; };
+    const mine = myPendingTrades();
+    const toMe = mine.filter(t=>t.toSlot===ms);
+    const fromMe = mine.filter(t=>t.fromSlot===ms);
+    html += '<div class="panel"><div class="display" style="font-size:20px">TRADE CENTER</div>'
+     + '<div style="color:var(--dim);font-size:13px;margin-top:4px">Any players, any counts \u2014 the other manager has to accept. Points already scored stay with the team; the player earns for their new squad from then on.</div>'
+     + (mpStatus?'<div class="chip" style="margin-top:8px;color:var(--med)">'+esc(mpStatus)+'</div>':'')
+     + '</div>';
+    if(toMe.length){
+      html += '<div class="panel" style="margin-top:12px;border-color:var(--gold)"><div style="font-size:12px;letter-spacing:1px;color:var(--gold);margin-bottom:8px">OFFERS FOR YOU</div>'
+       + toMe.map(t=>'<div class="feeditem" style="border-left:3px solid var(--gold);margin-bottom:8px">'
+          + '<div style="font-size:13.5px"><b>'+esc(game.teams[t.fromSlot].name)+'</b> offers <b style="color:var(--gold)">'+t.give.map(nm).map(esc).join(', ')+'</b>'
+          + ' for your <b style="color:var(--insane)">'+t.get.map(nm).map(esc).join(', ')+'</b></div>'
+          + '<div style="display:flex;gap:8px;margin-top:8px">'
+          + '<button class="smbtn" data-a="tradeAccept" data-id="'+esc(t.id)+'" style="border-color:var(--live);color:var(--live)" '+(mpLoading?'disabled':'')+'>\u2713 accept</button>'
+          + '<button class="smbtn" data-a="tradeDecline" data-id="'+esc(t.id)+'" style="border-color:var(--hard);color:var(--hard)" '+(mpLoading?'disabled':'')+'>\u2715 decline</button>'
+          + '</div></div>').join('')
+       + '</div>';
+    }
+    if(fromMe.length){
+      html += '<div class="panel" style="margin-top:12px"><div style="font-size:12px;letter-spacing:1px;color:var(--dim);margin-bottom:8px">YOUR PENDING OFFERS</div>'
+       + fromMe.map(t=>'<div class="feeditem" style="margin-bottom:8px"><div style="font-size:13px">to <b>'+esc(game.teams[t.toSlot].name)+'</b>: '
+          + esc(t.give.map(nm).join(', '))+' \u21C4 '+esc(t.get.map(nm).join(', '))+'</div>'
+          + '<button class="smbtn" data-a="tradeCancel" data-id="'+esc(t.id)+'" style="margin-top:6px" '+(mpLoading?'disabled':'')+'>cancel</button></div>').join('')
+       + '</div>';
+    }
+    if(!tradeDraft){
+      html += '<div class="panel" style="margin-top:12px"><div style="font-size:12px;letter-spacing:1px;color:var(--dim);margin-bottom:8px">PROPOSE A TRADE</div>'
+       + (partners.length
+          ? '<div style="display:flex;gap:8px;flex-wrap:wrap">'+partners.map(t=>'<button class="smbtn" data-a="tradeTo" data-id="'+t.id+'">with '+esc(t.name)+' (@'+esc(ownerName(t)||'')+')</button>').join('')+'</div>'
+          : '<div style="color:var(--dim);font-size:13px">No friend-managed teams yet \u2014 CPU squads don\u2019t answer the phone.</div>')
+       + '</div>';
+    } else {
+      const other = game.teams[tradeDraft.toSlot];
+      const chip = (pid, sel, act)=>'<button class="smbtn" data-a="'+act+'" data-id="'+esc(pid)+'" style="'+(sel?'border-color:var(--gold);color:var(--gold);background:rgba(255,210,77,.12)':'')+'">'+esc(nm(pid))+' <span class="mono" style="font-size:10px;color:var(--dim)">#'+gp(pid).rank+'</span></button>';
+      html += '<div class="panel" style="margin-top:12px"><div style="font-size:12px;letter-spacing:1px;color:var(--gold);margin-bottom:8px">TRADING WITH '+esc(other.name).toUpperCase()+'</div>'
+       + '<div style="font-size:12.5px;color:var(--dim);margin-bottom:6px">YOU SEND \u2014 tap to select:</div>'
+       + '<div style="display:flex;gap:6px;flex-wrap:wrap">'+ (game.teams[ms]?game.teams[ms].roster:[]).map(pid=>chip(pid, tradeDraft.give.includes(pid), 'tradeGive')).join('') +'</div>'
+       + '<div style="font-size:12.5px;color:var(--dim);margin:12px 0 6px">YOU GET \u2014 tap to select:</div>'
+       + '<div style="display:flex;gap:6px;flex-wrap:wrap">'+ other.roster.map(pid=>chip(pid, tradeDraft.get.includes(pid), 'tradeGet')).join('') +'</div>'
+       + '<div style="display:flex;gap:8px;margin-top:14px">'
+       + '<button class="bigbtn" data-a="tradeSend" style="width:auto;padding:12px 22px" '+((tradeDraft.give.length&&tradeDraft.get.length&&!mpLoading)?'':'disabled')+'>SEND OFFER</button>'
+       + '<button class="smbtn" data-a="tradeClear">discard</button></div></div>';
+    }
+    const hist = (game.trades||[]).filter(t=>t.status!=='pending').slice(0,6);
+    if(hist.length){
+      html += '<div class="panel" style="margin-top:12px"><div style="font-size:12px;letter-spacing:1px;color:var(--dim);margin-bottom:8px">RECENT</div>'
+       + hist.map(t=>'<div style="font-size:12.5px;color:var(--dim);padding:5px 0">'+esc(game.teams[t.fromSlot].name)+' \u21C4 '+esc(game.teams[t.toSlot].name)
+          + ' \u00B7 '+esc(t.give.map(nm).join(', '))+' for '+esc(t.get.map(nm).join(', '))
+          + ' \u00B7 <b style="color:'+(t.status==='accepted'?'var(--live)':'var(--hard)')+'">'+t.status+'</b></div>').join('')
+       + '</div>';
+    }
+  }
+
   if(tab==='team'){
     html += '<div class="panel"><div class="display" style="font-size:20px">'+esc(me.name)+' \u00B7 <span style="color:var(--gold)">'+me.pts+' pts</span></div>'
-     + '<div style="color:var(--dim);font-size:13px;margin-top:4px">'+(game.faUsedOn===today()?'Free-agent swap used today.':(dropSel?('Dropping <b style="color:var(--hard)">'+esc(gp(dropSel).name)+'</b> \u2014 pick a free agent below.'):'One swap per day: tap <b>drop</b>, then sign a free agent.'))+'</div>'
+     + '<div style="color:var(--dim);font-size:13px;margin-top:4px">'+(faUsedToday()?'Free-agent swap used today.':(dropSel?('Dropping <b style="color:var(--hard)">'+esc(gp(dropSel).name)+'</b> \u2014 pick a free agent below.'):'One swap per day: tap <b>drop</b>, then sign a free agent.'))+'</div>'
      + '<div style="color:var(--dim);font-size:12px;margin-top:4px">If a GD profile shows \u201Cnot found\u201D, their in-game name differs \u2014 tap <b>gd name</b> and fix it.</div></div>'
      + '<div class="grid" style="margin-top:12px">'
      + me.roster.slice().sort((a,b)=>gp(b).pts-gp(a).pts||gp(a).rank-gp(b).rank).map(pid=>{
@@ -644,7 +1146,7 @@ function render(){
          + '</div>';
        }).join('')
      + '</div>';
-    if(dropSel && game.faUsedOn!==today()){
+    if(dropSel && !faUsedToday()){
       html += '<div class="panel" style="margin-top:14px"><div style="font-size:12px;letter-spacing:1px;color:var(--dim);margin-bottom:8px">FREE AGENTS \u2014 tap to sign</div>'
        + '<div class="grid">'+game.pool.slice().sort((a,b)=>gp(a).rank-gp(b).rank).map(pid=>playerCardHTML(gp(pid),{clickable:true,action:'sign'})).join('')+'</div></div>';
     }
@@ -674,7 +1176,14 @@ function render(){
      + 'If every relay is down, that check just skips profiles and catches up next time.<br><br>'
      + '<b style="color:var(--text)">Fair play:</b> points only ever come from events with a real source \u2014 nothing is invented, and if a feed can\u2019t be reached, nothing is scored. '
      + 'CPU squads score from the exact same feeds. One free-agent swap per day. '
-     + 'GD profile counts include every rated demon (so a stream night of easy demons still pays 4 apiece), and list records stack on top.</div></div>';
+     + 'GD profile counts include every rated demon (so a stream night of easy demons still pays 4 apiece), and list records stack on top.</div></div>'
+     + (game.mode==='multi' ? ('<div class="panel" style="margin-top:12px"><div class="display" style="font-size:20px;margin-bottom:8px">FRIENDS LEAGUE</div>'
+     + '<div style="color:var(--dim);font-size:14px;line-height:1.6">'
+     + 'The league lives in a shared database (Supabase) \u2014 everyone sees the same standings, draft, and feed, and screens auto-refresh every \u007E25 seconds. '
+     + 'Accounts are a username + PIN <b style="color:var(--text)">per league</b>: the PIN is lightly scrambled, not bank-grade security, so never reuse a real password. '
+     + 'Anyone in the league can hit \u21BB check \u2014 a league lock stops two checks from double-counting. '
+     + 'Trades swap players between friend squads once the other manager accepts; already-scored points stay put, and the player earns for their new team going forward. '
+     + 'Logging out only affects your device \u2014 the league keeps living on the server for everyone else.</div></div>') : '');
   }
 
   html += '<div style="height:90px"></div></div>';
@@ -683,13 +1192,18 @@ function render(){
 }
 
 function headerHTML(){
-  const badge = (game&&game.phase==='live')?'<span class="chip mono">DAY '+Math.max(1,Math.round((Date.now()-new Date(game.startedAt+'T00:00:00').getTime())/86400000)+1)+'</span>':'';
-  return '<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 2px" class="wrap">'
+  const badge = (game&&game.phase==='live'&&game.startedAt)?'<span class="chip mono">DAY '+Math.max(1,Math.round((Date.now()-new Date(game.startedAt+'T00:00:00').getTime())/86400000)+1)+'</span>':'';
+  const code = (mode==='multi'&&game&&game.code)?'<span class="chip mono" style="color:var(--gold)">'+esc(game.code)+'</span>':'';
+  const toggles = '<span style="display:inline-flex;border:1px solid var(--line);border-radius:999px;overflow:hidden">'
+   + '<button class="smbtn" data-a="modeSolo" style="border:none;border-radius:0;'+(mode==='solo'?'background:rgba(255,210,77,.18);color:var(--gold)':'')+'">solo</button>'
+   + '<button class="smbtn" data-a="modeMulti" style="border:none;border-radius:0;'+(mode==='multi'?'background:rgba(255,210,77,.18);color:var(--gold)':'')+'">friends</button></span>';
+  const extras = mode==='multi'
+   ? '<button class="smbtn" data-a="mpRefreshBtn" title="Refresh league">\u21BB</button><button class="smbtn" data-a="reset">'+(mpSession?'log out':'back')+'</button>'
+   : '<button class="smbtn" data-a="resync" title="Re-sync board data">\u21BB board</button><button class="smbtn" data-a="reset">reset</button>';
+  return '<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 2px;flex-wrap:wrap;gap:8px" class="wrap">'
    + '<div style="display:flex;align-items:center;gap:10px">'+demonFace('#b44dff',30)
    + '<div class="display" style="font-size:20px">DEMON <span style="color:var(--gold)">MYTHS</span></div></div>'
-   + '<div style="display:flex;align-items:center;gap:8px">'+badge
-   + '<button class="smbtn" data-a="resync" title="Re-sync board data">\u21BB board</button>'
-   + '<button class="smbtn" data-a="reset">reset</button></div></div>';
+   + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'+toggles+code+badge+extras+'</div></div>';
 }
 function tickerHTML(){
   const bits=[];
@@ -703,9 +1217,9 @@ function tickerHTML(){
 }
 function resetHTML(){
   return '<div class="modalbg"><div class="modal" style="max-width:340px;text-align:center">'
-   + '<div style="font-size:30px">\uD83D\uDC80</div><div class="display" style="font-size:20px;margin:6px 0">Delete this season?</div>'
-   + '<div style="color:var(--dim);font-size:13px;margin-bottom:16px">Your saved league (and all its real tracked points) is wiped. No respawns.</div>'
-   + '<button class="bigbtn" data-a="resetConfirm">YES, WIPE IT</button>'
+   + '<div style="font-size:30px">\uD83D\uDC80</div><div class="display" style="font-size:20px;margin:6px 0">'+(mode==='multi'?'Log out of this league?':'Delete this season?')+'</div>'
+   + '<div style="color:var(--dim);font-size:13px;margin-bottom:16px">'+(mode==='multi'?'This only logs you out on this device \u2014 the shared league and everyone\u2019s points stay safe on the server.':'Your saved league (and all its real tracked points) is wiped. No respawns.')+'</div>'
+   + '<button class="bigbtn" data-a="resetConfirm">'+(mode==='multi'?'LOG OUT':'YES, WIPE IT')+'</button>'
    + '<button class="smbtn" data-a="resetCancel" style="margin-top:10px;border:none;background:transparent;color:var(--dim)">keep my season</button></div></div>';
 }
 
@@ -727,6 +1241,26 @@ document.addEventListener('click',(e)=>{
   else if(a==='resetCancel'){ confirmReset=false; render(); }
   else if(a==='resetConfirm') resetAll();
   else if(a==='resync'){ (async()=>{ DATA=null; render(); await bootData(true); render(); })(); }
+  else if(a==='modeSolo'){ if(mode!=='solo'){ mode='solo'; game=soloGameCache; tab='league'; mpStatus=''; render(); } }
+  else if(a==='modeMulti'){ if(mode!=='multi'){ soloGameCache=game; mode='multi'; game=null; tab='league';
+      if(mpSession){ mpLoading=true; render(); mpRefresh().then(()=>{ mpLoading=false; if(game&&game.phase==='draft') mpCpuAdvance(); render(); }); }
+      else { mpScreen = MP?'home':'connect'; render(); } } }
+  else if(a==='mpRefreshBtn'){ (async()=>{ mpLoading=true; render(); await mpRefresh(); mpLoading=false; if(game&&game.phase==='draft') mpCpuAdvance(); render(); })(); }
+  else if(a==='mpGoto'){ mpScreen=id; mpStatus=''; mpLoginPickId=null; window.__mpLoginRow=null; render(); }
+  else if(a==='mpSaveCfg') mpSaveCfg();
+  else if(a==='mpCreate') mpCreateLeague();
+  else if(a==='mpJoin') mpJoinLeague();
+  else if(a==='mpLogin') mpLogin();
+  else if(a==='mpLoginPick'){ mpLoginPickId=id; render(); }
+  else if(a==='mpStartDraft') mpStartDraft();
+  else if(a==='tradeTo'){ tradeDraft={toSlot:Number(id), give:[], get:[]}; render(); }
+  else if(a==='tradeGive'){ if(tradeDraft){ const i2=tradeDraft.give.indexOf(id); if(i2>=0) tradeDraft.give.splice(i2,1); else tradeDraft.give.push(id); render(); } }
+  else if(a==='tradeGet'){ if(tradeDraft){ const i2=tradeDraft.get.indexOf(id); if(i2>=0) tradeDraft.get.splice(i2,1); else tradeDraft.get.push(id); render(); } }
+  else if(a==='tradeSend') mpSendTrade();
+  else if(a==='tradeClear'){ tradeDraft=null; render(); }
+  else if(a==='tradeAccept') mpRespondTrade(id, true);
+  else if(a==='tradeDecline') mpRespondTrade(id, false);
+  else if(a==='tradeCancel') mpCancelTrade(id);
 });
 document.addEventListener('keydown',(e)=>{
   if((e.key==='Enter'||e.key===' ') && e.target.closest && e.target.closest('.card.clickable')){ e.preventDefault(); e.target.closest('.card.clickable').click(); }
@@ -740,9 +1274,24 @@ setInterval(()=>{ const outer=document.querySelector('.ticker-outer'); if(outer 
 (async function(){
   renderBoot();
   try{ const raw=await store.get(KEY_SAVE); if(raw){ const g=JSON.parse(raw); if(g&&g.phase) game=g; } }catch(e){}
+  try{ const c=await store.get(KEY_MPCFG); if(c) MP=JSON.parse(c); }catch(e){}
+  try{ const s2=await store.get(KEY_MPSES); if(s2) mpSession=JSON.parse(s2); }catch(e){}
   await bootData(false);
+  if(MP && mpSession){
+    bootLog.push('logging into your friends league\u2026'); renderBoot();
+    soloGameCache = game; game = null; mode='multi'; mpScreen='home';
+    await mpRefresh();
+    if(game && game.phase==='draft') mpCpuAdvance();
+  }
   render();
 })();
+
+// friends-league auto-refresh (skips while typing or syncing)
+setInterval(()=>{
+  if(mode!=='multi' || !game || syncing || mpLoading || !mpSession) return;
+  try{ const ae=document.activeElement; if(ae && (ae.tagName==='INPUT'||ae.tagName==='TEXTAREA')) return; }catch(e){}
+  mpRefresh(true).then(ch=>{ if(ch){ if(game && game.phase==='draft') mpCpuAdvance(); render(); } });
+}, 25000);
 </script>
 </body>
 </html>
