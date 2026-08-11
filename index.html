@@ -93,6 +93,11 @@ const store = {
     try{ if(!window.storage && window.localStorage) localStorage.removeItem(k); }catch(e){} },
 };
 const KEY_SAVE='dm3:save', KEY_DATA='dm3:data', KEY_MPCFG='dmmp:cfg', KEY_MPSES='dmmp:ses';
+// OPTIONAL: paste your Supabase Project URL + anon public key between the quotes
+// below and re-upload, and every visitor is auto-connected (no setup screen):
+const BUILT_IN_MP = { url:'', key:'' };
+function inviteLink(){ try{ if(!MP) return '';
+  return location.origin+location.pathname+'#sb='+encodeURIComponent(MP.url+'|'+MP.key); }catch(e){ return ''; } }
 
 // ---------- constants ----------
 const PC = 'https://pointercrate.com/api';
@@ -932,7 +937,7 @@ function render(){
        + '<input id="mpKey" type="text" placeholder="anon public key (long text)" value="'+esc(MP?MP.key:'')+'"/></div>'
        + status
        + '<button class="bigbtn" data-a="mpSaveCfg" style="margin-top:10px">SAVE & CONTINUE</button>'
-       + '<div style="color:var(--dim);font-size:11.5px;margin-top:10px">The anon key is made to be public \u2014 it ends up in your site anyway. Anyone with your site link can make leagues there, so only share the link with people you want in.</div>'
+       + '<div style="color:var(--dim);font-size:11.5px;margin-top:10px">The anon key is made to be public \u2014 it ends up in your site anyway. Anyone with your site link can make leagues there, so only share it with people you want in. After saving you\u2019ll get a <b style="color:var(--text)">friend setup link</b> so nobody else has to do this screen.</div>'
        + '</div></div>';
       app.innerHTML = html; if(confirmReset) app.innerHTML+=resetHTML();
       return;
@@ -946,6 +951,11 @@ function render(){
        + '<button class="bigbtn" data-a="mpGoto" data-id="create">CREATE A LEAGUE</button>'
        + '<button class="bigbtn" data-a="mpGoto" data-id="join" style="margin-top:10px">JOIN WITH A CODE</button>'
        + '<button class="bigbtn" data-a="mpGoto" data-id="login" style="margin-top:10px">LOG BACK IN</button>'
+       + '<div class="panel" style="margin-top:16px"><div style="font-size:12px;letter-spacing:1px;color:var(--dim);margin-bottom:6px">FRIEND SETUP LINK</div>'
+       + '<div style="color:var(--dim);font-size:12.5px;line-height:1.5;margin-bottom:8px">Send this to your friends — opening it auto-connects their device to your league server. Then they just JOIN with your league code.</div>'
+       + '<input id="invLink" type="text" readonly value="'+esc(inviteLink())+'" style="font-size:11px"/>'
+       + '<button class="smbtn" data-a="copyInvite" style="margin-top:8px">\uD83D\uDCCB copy link</button>'
+       + '</div>'
        + '<div style="text-align:center;margin-top:14px"><button class="smbtn" data-a="mpGoto" data-id="connect">server settings</button></div>'
        + '</div>';
       app.innerHTML = html; if(confirmReset) app.innerHTML+=resetHTML();
@@ -1247,6 +1257,10 @@ document.addEventListener('click',(e)=>{
       else { mpScreen = MP?'home':'connect'; render(); } } }
   else if(a==='mpRefreshBtn'){ (async()=>{ mpLoading=true; render(); await mpRefresh(); mpLoading=false; if(game&&game.phase==='draft') mpCpuAdvance(); render(); })(); }
   else if(a==='mpGoto'){ mpScreen=id; mpStatus=''; mpLoginPickId=null; window.__mpLoginRow=null; render(); }
+  else if(a==='copyInvite'){ (async()=>{ const L=inviteLink();
+      try{ await navigator.clipboard.writeText(L); mpStatus='link copied — paste it to your friends!'; }
+      catch(e){ try{ const el2=$('invLink'); el2.focus(); el2.select(); mpStatus='long-press the link box to copy'; }catch(e2){} }
+      render(); })(); }
   else if(a==='mpSaveCfg') mpSaveCfg();
   else if(a==='mpCreate') mpCreateLeague();
   else if(a==='mpJoin') mpJoinLeague();
@@ -1275,6 +1289,16 @@ setInterval(()=>{ const outer=document.querySelector('.ticker-outer'); if(outer 
   renderBoot();
   try{ const raw=await store.get(KEY_SAVE); if(raw){ const g=JSON.parse(raw); if(g&&g.phase) game=g; } }catch(e){}
   try{ const c=await store.get(KEY_MPCFG); if(c) MP=JSON.parse(c); }catch(e){}
+  try{ // friend setup link: yoursite/#sb=url|key -> auto-configure this device
+    if(typeof location!=='undefined' && location.hash){
+      const m=/[#&]sb=([^&]+)/.exec(location.hash);
+      if(m){ const parts=decodeURIComponent(m[1]).split('|');
+        if(parts[0]&&parts[1]&&/^https:\/\//.test(parts[0])){
+          MP={url:parts[0], key:parts[1]}; await store.set(KEY_MPCFG, JSON.stringify(MP));
+          try{ history.replaceState(null,'',location.pathname+location.search); }catch(e){}
+        } } }
+  }catch(e){}
+  if(!MP && BUILT_IN_MP.url && BUILT_IN_MP.key) MP = {url:BUILT_IN_MP.url, key:BUILT_IN_MP.key};
   try{ const s2=await store.get(KEY_MPSES); if(s2) mpSession=JSON.parse(s2); }catch(e){}
   await bootData(false);
   if(MP && mpSession){
